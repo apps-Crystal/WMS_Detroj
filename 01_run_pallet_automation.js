@@ -2,11 +2,13 @@ function runPalletAutomation(){
   // 1. Run the transaction and get the ID of the newly processed pallet (or null if skipped/failed).
   const newPalletId = updatePalletTransactionLedger();
   
-  // 2. Only run the sync if a new pallet transaction was actually recorded.
+  // 2. Only run the sync and status checks if a new pallet transaction was actually recorded.
   if (newPalletId) {
     syncPalletStatus(newPalletId);
+    // 3. New function to update the GRN status based on the pallet's current completion state.
+    checkAndMarkGRNStatus(newPalletId); 
   } else {
-    Logger.log("No new pallet added to Ledger (skipped due to duplicate or missing data). Skipping syncPalletStatus.");
+    Logger.log("No new pallet added to Ledger (skipped due to duplicate or missing data). Skipping syncPalletStatus and GRN check.");
   }
 }
 
@@ -225,8 +227,10 @@ function syncPalletStatus(targetPalletId) {
     BATCH_NUMBER: 6,        // G
     LOCATION_ID: 7,         // H
     CURRENT_QTY: 8,          // I
-    LAST_UPDATED: 9,         // J
-    ASSIGNMENT_STATUS: 10    // K
+    // TXN_TIMESTAMP: 9,        // J (Holds Ledger's transaction timestamp)
+    ASSIGNMENT_STATUS: 10,    // K
+    // Column L (Index 11) is skipped, so M is index 12 as requested
+    STATUS_UPDATE_TIMESTAMP: 12 // M (New column for script execution time)
   };
 
   /***************************************************
@@ -279,8 +283,9 @@ function syncPalletStatus(targetPalletId) {
     status[sRow][STATUS_COL.BATCH_NUMBER]    = row[LEDGER_COL.BATCH_NUMBER];
     status[sRow][STATUS_COL.CURRENT_QTY]     = row[LEDGER_COL.QTY_CHANGE];
     status[sRow][STATUS_COL.GRN_ID]          = row[LEDGER_COL.GRN_ID];
-    status[sRow][STATUS_COL.LAST_UPDATED]    = row[LEDGER_COL.TIMESTAMP];
-
+    // Update the transaction timestamp (J)
+    status[sRow][STATUS_COL.TXN_TIMESTAMP]    = row[LEDGER_COL.TIMESTAMP]; 
+    
     // Determine Occupancy and Assignment Status based on the transaction type
     const action = row[LEDGER_COL.ACTION_TYPE];
     if (action === "Built" || action === "Received" || action === "Putaway") {
@@ -298,6 +303,7 @@ function syncPalletStatus(targetPalletId) {
          status[sRow][STATUS_COL.EXPIRY_DATE]     = "";
          status[sRow][STATUS_COL.LOCATION_ID]     = ""; 
     }
+    
     ledgerUpdates = 1;
     log(`🔄 Updated Status from Ledger for Pallet: ${targetPalletId} | Action: ${action}`);
   } else {
@@ -329,8 +335,7 @@ function syncPalletStatus(targetPalletId) {
 
     // Only update if the expiry date is available and different
     if (newExpiry) {
-        // We always take the latest expiry from the Build sheet if it exists, 
-        // regardless of what's in Status, as Build is the source of truth for the SKU attributes.
+        // We always take the latest expiry from the Build sheet if it exists
         status[sRow][STATUS_COL.EXPIRY_DATE] = newExpiry;
         log(`🟢 Expiry Updated → ${targetPalletId} = ${newExpiry}`);
         expiryUpdates = 1;
@@ -344,15 +349,20 @@ function syncPalletStatus(targetPalletId) {
   log("\n📗 Build Expiry Updates Completed: " + expiryUpdates);
 
   /***************************************************
-   * WRITE BACK TO SHEET (Only write back the modified rows if necessary)
+   * 3) WRITE BACK TO SHEET (Only write back the modified rows if necessary)
    ***************************************************/
   if (ledgerUpdates > 0 || expiryUpdates > 0) {
       log("\n💾 Writing Updated Row Back to Pallet_Status_02...");
       
+      // Update the new Status Update Timestamp (M)
+      status[sRow][STATUS_COL.STATUS_UPDATE_TIMESTAMP] = new Date(); 
+      log(`⏱️ Status Update Timestamp (M) set to: ${status[sRow][STATUS_COL.STATUS_UPDATE_TIMESTAMP]}`);
+
       // We only write back the range that corresponds to the single updated row.
       // The updated row is status[sRow], which is at row index sRow + 1 in the sheet (since sRow is 1-indexed relative to data array, 0 is header)
       statusSheet
-        .getRange(sRow + 1, 1, 1, status[0].length)
+        // Note: The range size is now 13 columns (indices 0 to 12).
+        .getRange(sRow + 1, 1, 1, STATUS_COL.STATUS_UPDATE_TIMESTAMP + 1)
         .setValues([status[sRow]]);
       
       log("✅ WRITE COMPLETE for single row.");
@@ -370,4 +380,91 @@ function syncPalletStatus(targetPalletId) {
   log("• Expiry Updates Applied: " + expiryUpdates);
 
   log("\n🏁 DONE — Pallet Status Sync Completed Successfully");
+}
+
+/**
+ * Checks the Vehicle_Completed status for a pallet's GRN in Pallet_Build_IB_04
+ * and updates the Status in GRN_Entry_IB_01 to "Unloading in Progress" if not complete.
+ * @param {string} targetPalletId The Pallet_ID to check.
+ */
+function checkAndMarkGRNStatus(targetPalletId) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const buildSheet = ss.getSheetByName("Pallet_Build_IB_04");
+  const grnSheet = ss.getSheetByName("GRN_Entry_IB_01");
+
+  // Load all data
+  const buildData = buildSheet.getDataRange().getValues();
+  const buildHeaders = buildData[0];
+  const grnData = grnSheet.getDataRange().getValues();
+  const grnHeaders = grnData[0];
+
+  // 1. Map columns for Pallet_Build_IB_04
+  const P_GRN_ID_COL = buildHeaders.indexOf("GRN_ID");
+  const P_PALLET_ID_COL = buildHeaders.indexOf("Pallet_ID");
+  const P_VEHICLE_COMPLETED_COL = buildHeaders.indexOf("Vehicle_Completed");
+  
+  // 2. Map columns for GRN_Entry_IB_01
+  const G_GRN_ID_COL = grnHeaders.indexOf("GRN_ID");
+  const G_STATUS_COL = grnHeaders.indexOf("Status");
+
+  if (P_GRN_ID_COL === -1 || P_PALLET_ID_COL === -1 || P_VEHICLE_COMPLETED_COL === -1) {
+    Logger.log("⚠️ GRN Status Check ABORT: Missing required column in Pallet_Build_IB_04 (GRN_ID, Pallet_ID, or Vehicle_Completed).");
+    return;
+  }
+  if (G_GRN_ID_COL === -1 || G_STATUS_COL === -1) {
+    Logger.log("⚠️ GRN Status Check ABORT: Missing required column in GRN_Entry_IB_01 (GRN_ID or Status).");
+    return;
+  }
+  
+  // 3. Find the GRN_ID for the targetPalletId, and check its Vehicle_Completed status
+  let targetGRNId = null;
+  let isVehicleCompleted = true; // Assume true unless found otherwise
+
+  for (let i = 1; i < buildData.length; i++) {
+    const row = buildData[i];
+    // Find the row matching the target Pallet ID
+    if (row[P_PALLET_ID_COL] == targetPalletId) {
+      targetGRNId = row[P_GRN_ID_COL];
+      // Check the Vehicle_Completed status for this specific pallet
+      // We expect boolean FALSE or the string "FALSE"
+      if (row[P_VEHICLE_COMPLETED_COL] === false || String(row[P_VEHICLE_COMPLETED_COL]).toUpperCase() === "FALSE") {
+        isVehicleCompleted = false;
+        Logger.log(`Found Pallet ${targetPalletId} in GRN ${targetGRNId} with Vehicle_Completed = FALSE.`);
+      }
+      break; // Found the pallet and checked its completion status
+    }
+  }
+
+  if (!targetGRNId) {
+    Logger.log(`⚠️ GRN Status Check: Could not find GRN_ID for Pallet_ID: ${targetPalletId} in Pallet_Build_IB_04. Aborting GRN status update.`);
+    return;
+  }
+
+  // 4. Update GRN Status if Vehicle_Completed is FALSE (meaning unloading is still active)
+  if (!isVehicleCompleted) {
+    let grnRowIndex = -1;
+    // Find the row corresponding to the GRN_ID in GRN_Entry_IB_01
+    for (let i = 1; i < grnData.length; i++) {
+      if (grnData[i][G_GRN_ID_COL] == targetGRNId) {
+        grnRowIndex = i;
+        break;
+      }
+    }
+
+    if (grnRowIndex !== -1) {
+      const newStatus = "Unloading in Progress";
+      
+      // Update the Status column (G_STATUS_COL + 1 for 1-based index)
+      // and the row index (grnRowIndex + 1 for 1-based index)
+      grnSheet
+        .getRange(grnRowIndex + 1, G_STATUS_COL + 1)
+        .setValue(newStatus);
+      
+      Logger.log(`✅ GRN Status Updated: GRN ${targetGRNId} status set to "${newStatus}" in GRN_Entry_IB_01.`);
+    } else {
+      Logger.log(`⚠️ GRN Status Check: GRN_ID ${targetGRNId} not found in GRN_Entry_IB_01. Could not update status.`);
+    }
+  } else {
+    Logger.log(`✔️ GRN Status Check: Vehicle_Completed is not FALSE for Pallet ${targetPalletId}. No change to GRN status required.`);
+  }
 }
