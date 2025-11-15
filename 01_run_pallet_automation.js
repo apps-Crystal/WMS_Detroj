@@ -407,6 +407,7 @@ function checkAndMarkGRNStatus(targetPalletId) {
   const G_GRN_ID_COL = grnHeaders.indexOf("GRN_ID");
   const G_STATUS_COL = grnHeaders.indexOf("Status");
 
+  // Input validation
   if (P_GRN_ID_COL === -1 || P_PALLET_ID_COL === -1 || P_VEHICLE_COMPLETED_COL === -1) {
     Logger.log("⚠️ GRN Status Check ABORT: Missing required column in Pallet_Build_IB_04 (GRN_ID, Pallet_ID, or Vehicle_Completed).");
     return;
@@ -416,22 +417,26 @@ function checkAndMarkGRNStatus(targetPalletId) {
     return;
   }
   
-  // 3. Find the GRN_ID for the targetPalletId, and check its Vehicle_Completed status
+  // 3. Find the GRN_ID and the Vehicle_Completed status for the targetPalletId
   let targetGRNId = null;
-  let isVehicleCompleted = true; // Assume true unless found otherwise
+  let isPalletCompleted = false; // Initialize to false
 
   for (let i = 1; i < buildData.length; i++) {
     const row = buildData[i];
     // Find the row matching the target Pallet ID
     if (row[P_PALLET_ID_COL] == targetPalletId) {
       targetGRNId = row[P_GRN_ID_COL];
+      
       // Check the Vehicle_Completed status for this specific pallet
-      // We expect boolean FALSE or the string "FALSE"
-      if (row[P_VEHICLE_COMPLETED_COL] === false || String(row[P_VEHICLE_COMPLETED_COL]).toUpperCase() === "FALSE") {
-        isVehicleCompleted = false;
-        Logger.log(`Found Pallet ${targetPalletId} in GRN ${targetGRNId} with Vehicle_Completed = FALSE.`);
+      const completedValue = row[P_VEHICLE_COMPLETED_COL];
+
+      // Check for TRUE (boolean or string) to set isPalletCompleted
+      if (completedValue === true || String(completedValue).toUpperCase() === "TRUE") {
+        isPalletCompleted = true;
       }
-      break; // Found the pallet and checked its completion status
+      // If it's FALSE or blank, it remains false
+
+      break; // Found the pallet and checked its status
     }
   }
 
@@ -440,31 +445,35 @@ function checkAndMarkGRNStatus(targetPalletId) {
     return;
   }
 
-  // 4. Update GRN Status if Vehicle_Completed is FALSE (meaning unloading is still active)
-  if (!isVehicleCompleted) {
-    let grnRowIndex = -1;
-    // Find the row corresponding to the GRN_ID in GRN_Entry_IB_01
-    for (let i = 1; i < grnData.length; i++) {
-      if (grnData[i][G_GRN_ID_COL] == targetGRNId) {
-        grnRowIndex = i;
-        break;
-      }
-    }
-
-    if (grnRowIndex !== -1) {
-      const newStatus = "Unloading in Progress";
-      
-      // Update the Status column (G_STATUS_COL + 1 for 1-based index)
-      // and the row index (grnRowIndex + 1 for 1-based index)
-      grnSheet
-        .getRange(grnRowIndex + 1, G_STATUS_COL + 1)
-        .setValue(newStatus);
-      
-      Logger.log(`✅ GRN Status Updated: GRN ${targetGRNId} status set to "${newStatus}" in GRN_Entry_IB_01.`);
-    } else {
-      Logger.log(`⚠️ GRN Status Check: GRN_ID ${targetGRNId} not found in GRN_Entry_IB_01. Could not update status.`);
-    }
+  // 4. Determine and apply the new status based on the single pallet's completion state
+  let newStatus = "";
+  if (isPalletCompleted) {
+    newStatus = "Unloading Completed";
+    Logger.log(`🟢 Pallet ${targetPalletId} is TRUE. Setting GRN ${targetGRNId} Status to "${newStatus}".`);
   } else {
-    Logger.log(`✔️ GRN Status Check: Vehicle_Completed is not FALSE for Pallet ${targetPalletId}. No change to GRN status required.`);
+    // If the pallet is FALSE (or blank/not found), keep/set status to In Progress
+    newStatus = "Unloading in Progress";
+    Logger.log(`🟡 Pallet ${targetPalletId} is FALSE/incomplete. Setting GRN ${targetGRNId} Status to "${newStatus}".`);
+  }
+  
+  // 5. Find the GRN row and update the status
+  let grnRowIndex = -1;
+  for (let i = 1; i < grnData.length; i++) {
+    if (grnData[i][G_GRN_ID_COL] == targetGRNId) {
+      grnRowIndex = i;
+      break;
+    }
+  }
+
+  if (grnRowIndex !== -1) {
+    // Update the Status column (G_STATUS_COL + 1 for 1-based index)
+    // and the row index (grnRowIndex + 1 for 1-based index)
+    grnSheet
+      .getRange(grnRowIndex + 1, G_STATUS_COL + 1)
+      .setValue(newStatus);
+    
+    Logger.log(`✅ GRN Status Updated: GRN ${targetGRNId} status set to "${newStatus}" in GRN_Entry_IB_01.`);
+  } else {
+    Logger.log(`⚠️ GRN Status Check: GRN_ID ${targetGRNId} not found in GRN_Entry_IB_01. Could not update status.`);
   }
 }
